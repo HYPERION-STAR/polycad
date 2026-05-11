@@ -117,6 +117,8 @@ class OpenGLWidget(QWidget):
     viewport_object_selected = Signal(object)   # BaseObject or None
     # Emitted when user drags the gizmo and moves an object
     viewport_object_moved = Signal(object)      # BaseObject that was moved
+    # Emitted when the user releases the gizmo drag
+    viewport_drag_finished = Signal(object, object, object) # obj, old_data, new_data
 
     def __init__(self):
         super().__init__()
@@ -126,6 +128,7 @@ class OpenGLWidget(QWidget):
         self._selected_obj = None     # Currently selected BaseObject
         self._dragging_axis = None    # 'x', 'y', 'z' or None
         self._drag_last_mouse = None  # (x, y) screen pos
+        self._drag_start_data = None  # ObjectData before drag started
 
         # Use pyqtgraph's built-in GL view widget
         self._gl_view = gl.GLViewWidget()
@@ -192,6 +195,14 @@ class OpenGLWidget(QWidget):
             self._dragging_axis = None
             self._drag_last_mouse = None
             self._gizmo.highlight_axis(None)
+            
+    def _finish_drag(self):
+        """Finish drag and emit signal for undo history if changed."""
+        if self._dragging_axis is not None and self._selected_obj is not None and self._drag_start_data is not None:
+            new_data = self._selected_obj.to_data()
+            if self._drag_start_data.model_dump() != new_data.model_dump():
+                self.viewport_drag_finished.emit(self._selected_obj, self._drag_start_data, new_data)
+        self._reset_drag_state()
 
     def eventFilter(self, watched, event):
         """Intercept mouse events on the GLViewWidget for picking/gizmo."""
@@ -202,7 +213,7 @@ class OpenGLWidget(QWidget):
 
         # Safety: if focus or mouse leaves the widget, cancel any active drag
         if etype in (QEvent.Type.FocusOut, QEvent.Type.Leave):
-            self._reset_drag_state()
+            self._finish_drag()
             return super().eventFilter(watched, event)
 
         if etype == QEvent.Type.MouseButtonPress:
@@ -215,7 +226,7 @@ class OpenGLWidget(QWidget):
 
         elif etype == QEvent.Type.MouseButtonRelease:
             if self._dragging_axis is not None:
-                self._reset_drag_state()
+                self._finish_drag()
                 return True
 
         return super().eventFilter(watched, event)
@@ -231,6 +242,7 @@ class OpenGLWidget(QWidget):
             if hit_axis is not None:
                 self._dragging_axis = hit_axis
                 self._drag_last_mouse = (mx, my)
+                self._drag_start_data = self._selected_obj.to_data()
                 self._gizmo.highlight_axis(hit_axis)
                 return True  # Consume — don't orbit camera
 

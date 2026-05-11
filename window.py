@@ -109,6 +109,39 @@ class DeleteObjectsCommand:
         self._window.statusbar.showMessage(f"Redo: deleted {count} object(s).")
 
 
+class ModifyObjectCommand:
+    """Undoable command for changing object properties (transform, color)."""
+
+    def __init__(self, window, obj, old_data, new_data):
+        self._window = window
+        self._obj_id = obj.id
+        self._old_data = old_data
+        self._new_data = new_data
+
+    def undo(self):
+        self._apply_data(self._old_data, "Undo: reversed property change.")
+
+    def redo(self):
+        self._apply_data(self._new_data, "Redo: restored property change.")
+
+    def _apply_data(self, data, msg):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        obj = doc.get_object_by_id(self._obj_id)
+        if obj:
+            obj.from_data(data)
+            self._window._apply_transform_to_mesh(obj)
+            self._window._on_color_changed(obj)
+            
+            # Update UI if it's currently selected
+            if obj.id in doc.selected_ids:
+                self._window.gl_widget.update_gizmo_position(obj)
+                self._window.prop_panel.update_for_object(obj)
+            
+            self._window.statusbar.showMessage(msg)
+
 # ====================================================================== #
 #  Main Window
 # ====================================================================== #
@@ -296,6 +329,9 @@ class MainWindow(QMainWindow):
         # Viewport click-to-select and gizmo drag signals
         self.gl_widget.viewport_object_selected.connect(self._on_viewport_select)
         self.gl_widget.viewport_object_moved.connect(self._on_viewport_move)
+        self.gl_widget.viewport_drag_finished.connect(self._on_property_edit_finished)
+        
+        self.prop_panel.property_edit_finished.connect(self._on_property_edit_finished)
 
         self.setCentralWidget(central)
 
@@ -569,23 +605,25 @@ class MainWindow(QMainWindow):
 
                 f.write(f"o {obj.name}\n")
 
-                # Write vertices (apply object transform)
+                # Embed original transforms and color as PolyCAD specific metadata
+                f.write(f"# PolyCADData: color {obj.color[0]:.6f} {obj.color[1]:.6f} {obj.color[2]:.6f}\n")
+                f.write(f"# PolyCADData: pos {obj.position[0]:.6f} {obj.position[1]:.6f} {obj.position[2]:.6f}\n")
+                f.write(f"# PolyCADData: rot {obj.rotation_euler[0]:.6f} {obj.rotation_euler[1]:.6f} {obj.rotation_euler[2]:.6f}\n")
+                f.write(f"# PolyCADData: scale {obj.scale[0]:.6f} {obj.scale[1]:.6f} {obj.scale[2]:.6f}\n")
+
+                # Write raw vertices (NOT transformed, because we save the transform above)
                 for i in range(num_verts):
                     px, py, pz = positions[i]
-                    # Apply position offset
-                    px += obj.position[0]
-                    py += obj.position[1]
-                    pz += obj.position[2]
                     f.write(f"v {px:.6f} {py:.6f} {pz:.6f}\n")
 
                 for i in range(num_verts):
                     nx, ny, nz = normals[i]
                     f.write(f"vn {nx:.6f} {ny:.6f} {nz:.6f}\n")
 
-                for i in range(0, len(indices), 3):
-                    idx0 = indices[i] + 1 + vertex_offset
-                    idx1 = indices[i + 1] + 1 + vertex_offset
-                    idx2 = indices[i + 2] + 1 + vertex_offset
+                for face in indices:
+                    idx0 = face[0] + 1 + vertex_offset
+                    idx1 = face[1] + 1 + vertex_offset
+                    idx2 = face[2] + 1 + vertex_offset
                     f.write(f"f {idx0}//{idx0} {idx1}//{idx1} {idx2}//{idx2}\n")
 
                 vertex_offset += num_verts
@@ -625,14 +663,34 @@ class MainWindow(QMainWindow):
             self.statusbar.showMessage("No geometry found in OBJ file.")
             return
 
-        for obj_name, positions, normals, indices in objects_imported:
+        for obj_name, positions, normals, indices, metadata in objects_imported:
             # Use filename as name if no object name in file
             if not obj_name:
                 obj_name = os.path.splitext(os.path.basename(path))[0]
 
             obj = BaseObject(name=obj_name)
-            color = (0.7, 0.7, 0.85)  # Default gray for imports
+            
+            # Restore metadata if it came from PolyCAD, otherwise use sensible defaults
+            color = metadata.get('color', (0.7, 0.7, 0.85))
             obj.set_color(*color)
+            
+            pos = metadata.get('pos', (0.0, 0.0, 0.0))
+            obj.position = np.array(pos, dtype=np.float32)
+            
+            rot = metadata.get('rot', (0.0, 0.0, 0.0))
+            obj.rotation_euler = np.array(rot, dtype=np.float32)
+            
+            scale = metadata.get('scale', (1.0, 1.0, 1.0))
+            obj.scale = np.array(scale, dtype=np.float32)
+
+            # If it's a generic third-party OBJ without metadata, center the vertices 
+            # so the pivot point isn't millions of miles away from the mesh
+            if 'pos' not in metadata and len(positions) > 0:
+                min_bounds = np.min(positions, axis=0)
+                max_bounds = np.max(positions, axis=0)
+                centroid = (min_bounds + max_bounds) / 2.0
+                positions = positions - centroid
+                obj.position = np.array(centroid, dtype=np.float32)
 
             try:
                 mesh_item = self.gl_widget.add_primitive(
@@ -686,12 +744,13 @@ class MainWindow(QMainWindow):
         # Current object being parsed
         current_name = ""
         current_faces = []  # list of [(vi, ni), ...] per face
+        current_metadata = {}
 
         results = []
 
         def _flush_object():
             """Convert accumulated faces into arrays and append to results."""
-            nonlocal current_name, current_faces
+            nonlocal current_name, current_faces, current_metadata
             if not current_faces:
                 return
 
@@ -726,15 +785,26 @@ class MainWindow(QMainWindow):
                     current_name,
                     np.array(out_positions, dtype=np.float32),
                     np.array(out_normals, dtype=np.float32),
-                    np.array(out_indices, dtype=np.uint32),
+                    np.array(out_indices, dtype=np.uint32).reshape(-1, 3),
+                    current_metadata
                 ))
 
             current_faces = []
+            current_metadata = {}
 
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
+                if not line:
+                    continue
+                    
+                if line.startswith("#"):
+                    if line.startswith("# PolyCADData:"):
+                        parts = line.split()
+                        if len(parts) >= 6:
+                            key = parts[2]
+                            vals = (float(parts[3]), float(parts[4]), float(parts[5]))
+                            current_metadata[key] = vals
                     continue
 
                 parts = line.split()
@@ -849,6 +919,14 @@ class MainWindow(QMainWindow):
                 mesh_item,
                 (float(obj.color[0]), float(obj.color[1]), float(obj.color[2]))
             )
+
+    def _on_property_edit_finished(self, obj, old_data, new_data):
+        """Called when a spinbox edit or viewport drag concludes."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if doc:
+            cmd = ModifyObjectCommand(self, obj, old_data, new_data)
+            doc.push_command(cmd)
 
     def _apply_transform_to_mesh(self, obj):
         """Build a pyqtgraph Transform3D from the object and apply it."""

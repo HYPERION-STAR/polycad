@@ -316,12 +316,14 @@ class PropertyPanel(QWidget):
 
     transform_changed = Signal(object)
     color_changed = Signal(object)
+    property_edit_finished = Signal(object, object, object)  # obj, old_data, new_data
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(220)
         self._current_obj = None
         self._updating = False
+        self._pending_old_data = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -383,6 +385,7 @@ class PropertyPanel(QWidget):
                 if suffix: spin.setSuffix(suffix)
                 if default is not None: spin.setValue(default)
                 spin.valueChanged.connect(self._on_value_changed)
+                spin.editingFinished.connect(self._on_editing_finished)
                 setattr(self, f"{prefix}_{axis.lower()}", spin)
                 row.addWidget(lbl)
                 row.addWidget(spin, 1)
@@ -524,8 +527,18 @@ class PropertyPanel(QWidget):
     def _on_value_changed(self):
         if self._updating or self._current_obj is None:
             return
+        if self._pending_old_data is None:
+            self._pending_old_data = self._current_obj.to_data()
+            
         self.apply_changes()
         self.transform_changed.emit(self._current_obj)
+
+    def _on_editing_finished(self):
+        if self._pending_old_data is not None and self._current_obj is not None:
+            new_data = self._current_obj.to_data()
+            if self._pending_old_data.model_dump() != new_data.model_dump():
+                self.property_edit_finished.emit(self._current_obj, self._pending_old_data, new_data)
+            self._pending_old_data = None
 
     # ------------------------------------------------------------------ #
     #  Write spin-box values → object
@@ -570,7 +583,13 @@ class PropertyPanel(QWidget):
         selected = QColorDialog.getColor(qt_color, self, "Select Color")
 
         if selected.isValid():
+            old_data = obj.to_data()
             obj.set_color(selected.redF(), selected.greenF(), selected.blueF())
+            new_data = obj.to_data()
+            
+            if old_data.model_dump() != new_data.model_dump():
+                self.property_edit_finished.emit(obj, old_data, new_data)
+                
             color_hex = selected.name()
             self.color_btn.setStyleSheet(f"""
                 QPushButton {{

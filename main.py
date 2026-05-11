@@ -1,47 +1,31 @@
-"""PolyCAD — Main application entry point."""
-
 import os
 import sys
 
-
 def main():
-    """Entry point for the PolyCAD application."""
-    # Ensure project root is in sys.path when running directly (not via -m)
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _project_root not in sys.path:
         sys.path.insert(0, _project_root)
-
-    # Set high-DPI scaling before creating QApplication
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     app.setApplicationName("PolyCAD")
     app.setOrganizationName("polycad")
-
-    # Apply global dark theme stylesheet
     app.setStyleSheet(_get_stylesheet())
-
     from polycad.window import MainWindow
     window = MainWindow()
     window.show()
-
     sys.exit(app.exec())
 
-
 def _get_stylesheet() -> str:
-    """Return a cohesive dark-theme stylesheet for the entire application."""
-    # Compute absolute paths to arrow icons (Qt CSS needs forward slashes)
     _icons_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "icons"
     ).replace("\\", "/")
     _arrow_up = f"{_icons_dir}/arrow_up.png"
     _arrow_down = f"{_icons_dir}/arrow_down.png"
-
     css = """
     /* ===== Global ===== */
     QWidget {
@@ -50,12 +34,10 @@ def _get_stylesheet() -> str:
         font-family: "Segoe UI", "Inter", sans-serif;
         font-size: 10pt;
     }
-
     /* ===== Main Window ===== */
     QMainWindow {
         background-color: #1e1e2e;
     }
-
     /* ===== Menu Bar ===== */
     QMenuBar {
         background-color: #181825;
@@ -88,7 +70,6 @@ def _get_stylesheet() -> str:
         background: #313244;
         margin: 4px 8px;
     }
-
     /* ===== Status Bar ===== */
     QStatusBar {
         background-color: #181825;
@@ -101,7 +82,6 @@ def _get_stylesheet() -> str:
         padding: 0 8px;
         background-color: transparent;
     }
-
     /* ===== Splitter ===== */
     QSplitter::handle {
         background-color: #313244;
@@ -110,7 +90,6 @@ def _get_stylesheet() -> str:
     QSplitter::handle:hover {
         background-color: #89b4fa;
     }
-
     /* ===== Push Buttons (toolbar & general) ===== */
     QPushButton {
         background-color: #313244;
@@ -132,7 +111,6 @@ def _get_stylesheet() -> str:
         color: #1e1e2e;
         border-color: #89b4fa;
     }
-
     /* ===== Spin Boxes ===== */
     QDoubleSpinBox, QSpinBox {
         background-color: #313244;
@@ -148,7 +126,6 @@ def _get_stylesheet() -> str:
     QDoubleSpinBox:focus, QSpinBox:focus {
         border-color: #89b4fa;
     }
-
     /* Up button */
     QDoubleSpinBox::up-button, QSpinBox::up-button {
         subcontrol-origin: border;
@@ -167,7 +144,6 @@ def _get_stylesheet() -> str:
         width: 10px;
         height: 6px;
     }
-
     /* Down button */
     QDoubleSpinBox::down-button, QSpinBox::down-button {
         subcontrol-origin: border;
@@ -186,7 +162,6 @@ def _get_stylesheet() -> str:
         width: 10px;
         height: 6px;
     }
-
     /* ===== Tree Widget (Scene Objects) ===== */
     QTreeWidget {
         background-color: #1e1e2e;
@@ -215,13 +190,11 @@ def _get_stylesheet() -> str:
         font-weight: bold;
         font-size: 9pt;
     }
-
     /* ===== Labels ===== */
     QLabel {
         background-color: transparent;
         color: #cdd6f4;
     }
-
     /* ===== Scroll Bars ===== */
     QScrollBar:vertical {
         background: #1e1e2e;
@@ -239,7 +212,6 @@ def _get_stylesheet() -> str:
     QScrollBar::add-line, QScrollBar::sub-line {
         height: 0;
     }
-
     /* ===== Tooltips ===== */
     QToolTip {
         background-color: #313244;
@@ -249,11 +221,8 @@ def _get_stylesheet() -> str:
         padding: 4px 8px;
     }
     """
-
     css = css.replace("%%ARROW_UP%%", _arrow_up)
     css = css.replace("%%ARROW_DOWN%%", _arrow_down)
     return css
-
-
 if __name__ == "__main__":
     main()
