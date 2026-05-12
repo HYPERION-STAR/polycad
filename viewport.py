@@ -116,19 +116,20 @@ class OpenGLWidget(QWidget):
     # Emitted when user clicks an object or background in the viewport
     viewport_object_selected = Signal(object)   # BaseObject or None
     # Emitted when user drags the gizmo and moves an object
-    viewport_object_moved = Signal(object)      # BaseObject that was moved
-    # Emitted when the user releases the gizmo drag
-    viewport_drag_finished = Signal(object, object, object) # obj, old_data, new_data
+    viewport_object_moved = Signal(object)      # BaseObject that was moved (primary)
+    # Emitted when the user releases the gizmo drag — list of edits so
+    # multi-select drags batch into one undo entry.
+    viewport_drag_finished = Signal(list)       # [(obj, old_data, new_data), ...]
 
     def __init__(self):
         super().__init__()
         self._objects = []  # Track all mesh items with their transforms
 
         # Gizmo / interaction state
-        self._selected_obj = None     # Currently selected BaseObject
+        self._selected_obj = None     # Currently selected BaseObject (primary)
         self._dragging_axis = None    # 'x', 'y', 'z' or None
         self._drag_last_mouse = None  # (x, y) screen pos
-        self._drag_start_data = None  # ObjectData before drag started
+        self._drag_start_datas: dict = {}   # obj_id -> ObjectData at drag start
 
         # Use pyqtgraph's built-in GL view widget
         self._gl_view = gl.GLViewWidget()
@@ -194,14 +195,25 @@ class OpenGLWidget(QWidget):
         if self._dragging_axis is not None:
             self._dragging_axis = None
             self._drag_last_mouse = None
+            self._drag_start_datas = {}
             self._gizmo.highlight_axis(None)
-            
+
     def _finish_drag(self):
-        """Finish drag and emit signal for undo history if changed."""
-        if self._dragging_axis is not None and self._selected_obj is not None and self._drag_start_data is not None:
-            new_data = self._selected_obj.to_data()
-            if self._drag_start_data.model_dump() != new_data.model_dump():
-                self.viewport_drag_finished.emit(self._selected_obj, self._drag_start_data, new_data)
+        """Finish drag and emit one batch edit signal for undo history."""
+        if self._dragging_axis is not None and self._drag_start_datas:
+            from polycad.scene import Document
+            doc = Document.instance()
+            edits: list = []
+            if doc is not None:
+                for oid, old_data in self._drag_start_datas.items():
+                    obj = doc.get_object_by_id(oid)
+                    if obj is None:
+                        continue
+                    new_data = obj.to_data()
+                    if old_data.model_dump() != new_data.model_dump():
+                        edits.append((obj, old_data, new_data))
+            if edits:
+                self.viewport_drag_finished.emit(edits)
         self._reset_drag_state()
 
     def eventFilter(self, watched, event):
@@ -240,9 +252,26 @@ class OpenGLWidget(QWidget):
         if self._gizmo.visible and self._selected_obj is not None:
             hit_axis = self._pick_gizmo_axis(mx, my)
             if hit_axis is not None:
+                # Refuse drag if the primary's layer is locked
+                from polycad.scene import Document
+                doc = Document.instance()
+                if doc is not None:
+                    _, locked = doc.get_object_render_state(self._selected_obj.id)
+                    if locked:
+                        return False
                 self._dragging_axis = hit_axis
                 self._drag_last_mouse = (mx, my)
-                self._drag_start_data = self._selected_obj.to_data()
+                # Snapshot every selected object's state so the drag delta
+                # can fan out across the whole multi-selection.
+                self._drag_start_datas = {}
+                if doc is not None:
+                    ids = doc.selected_ids
+                    if not ids:
+                        ids = {self._selected_obj.id}
+                    for oid in ids:
+                        obj = doc.get_object_by_id(oid)
+                        if obj is not None:
+                            self._drag_start_datas[oid] = obj.to_data()
                 self._gizmo.highlight_axis(hit_axis)
                 return True  # Consume — don't orbit camera
 
@@ -307,12 +336,22 @@ class OpenGLWidget(QWidget):
         # Convert screen pixels to world units
         world_delta = proj / screen_len
 
-        # Apply movement to the object
-        obj.position[0] += axis_dir[0] * world_delta
-        obj.position[1] += axis_dir[1] * world_delta
-        obj.position[2] += axis_dir[2] * world_delta
+        # Build the world-space delta vector once and apply it to every
+        # selected object — primary moves where the gizmo is dragged, the
+        # rest follow by the same amount (Blender-style multi-drag).
+        delta = axis_dir * world_delta
+        from polycad.scene import Document
+        doc = Document.instance()
+        target_ids = list(self._drag_start_datas.keys()) if self._drag_start_datas else [obj.id]
+        for oid in target_ids:
+            o = doc.get_object_by_id(oid) if doc is not None else None
+            if o is None:
+                continue
+            o.position[0] += float(delta[0])
+            o.position[1] += float(delta[1])
+            o.position[2] += float(delta[2])
 
-        # Update gizmo position
+        # Update gizmo position (follows primary)
         new_pos = np.array([
             float(obj.position[0]),
             float(obj.position[1]),
@@ -320,7 +359,7 @@ class OpenGLWidget(QWidget):
         ])
         self._gizmo.show_at(new_pos)
 
-        # Emit signal so MainWindow updates the mesh transform and property panel
+        # Emit signal so MainWindow updates every selected mesh + panel
         self.viewport_object_moved.emit(obj)
 
         self._drag_last_mouse = (mx, my)
@@ -405,6 +444,10 @@ class OpenGLWidget(QWidget):
         best_dist = threshold
 
         for obj in doc.get_all_objects():
+            # Skip objects in hidden or locked layers
+            visible, locked = doc.get_object_render_state(obj.id)
+            if not visible or locked:
+                continue
             pos = np.array([
                 float(obj.position[0]),
                 float(obj.position[1]),
@@ -571,6 +614,35 @@ class OpenGLWidget(QWidget):
                 item.opts['drawEdges'] = enabled
                 item.opts['edgeColor'] = (1.0, 1.0, 1.0, 0.4)
                 item.meshDataChanged()
+
+    def set_mesh_visibility(self, mesh_item, visible: bool):
+        """Toggle a mesh item's visibility without removing it from the view."""
+        if mesh_item is None:
+            return
+        try:
+            mesh_item.setVisible(bool(visible))
+        except Exception:
+            pass
+
+    def set_render_order(self, ordered_mesh_items):
+        """Reorder GL view items so they paint back→front.
+
+        pyqtgraph paints items in the order they appear in `_gl_view.items`.
+        We remove the user meshes from that list and re-append them in the
+        desired back→front order. Non-user items (grid, axis lines, gizmo
+        shafts) are left untouched.
+        """
+        if not ordered_mesh_items:
+            return
+        items_list = self._gl_view.items
+        # Pull out only those we're reordering; others keep their slot
+        for m in ordered_mesh_items:
+            if m in items_list:
+                items_list.remove(m)
+        # Re-append in target order: last appended = drawn last = frontmost
+        for m in ordered_mesh_items:
+            items_list.append(m)
+        self._gl_view.update()
 
     def update_mesh_color(self, mesh_item, color_rgb):
         if mesh_item is None:

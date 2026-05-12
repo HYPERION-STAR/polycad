@@ -133,7 +133,7 @@ class BaseObject:
     def __init__(self, name: str = "", color: tuple[float, float, float] | None = None):
         self._id = BaseObject.next_id
         BaseObject.next_id += 1
-        
+
         self.name = name or f"Object_{self._id}"
         self.position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.rotation_euler = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -143,6 +143,7 @@ class BaseObject:
         self.mesh = None
         self.color = np.array(color if color else [0.7, 0.7, 0.85], dtype=np.float32)
         self.selected = False
+        self.layer_id: int | None = None    # Set by Document.add_object
 
     @property
     def id(self) -> int:
@@ -190,6 +191,34 @@ def create_object(name: str, mesh_data_factory, color: tuple | None = None) -> B
 
 
 # ====================================================================== #
+#  Layer
+# ====================================================================== #
+
+class Layer:
+    """A render group with z-order, visibility and lock state.
+
+    Layers are stored in Document._layers as an ordered list where
+    index 0 is the *backmost* layer and index -1 is the *frontmost*.
+    Inside a layer, _object_ids is also order-significant: [0] = back,
+    [-1] = front. The flat render order is just the concatenation of
+    every visible layer's _object_ids, back-to-front.
+    """
+    next_id = 0
+
+    def __init__(self, name: str = "Layer"):
+        self._id = Layer.next_id
+        Layer.next_id += 1
+        self.name = name
+        self.visible = True
+        self.locked = False
+        self._object_ids: list[int] = []   # Order: [0]=back, [-1]=front
+
+    @property
+    def id(self) -> int:
+        return self._id
+
+
+# ====================================================================== #
 #  Document Singleton
 # ====================================================================== #
 
@@ -203,6 +232,151 @@ class Document:
         self._selected_ids: set[int] = set()
         self._undo_stack: deque = deque()
         self._redo_stack: deque = deque()
+        self._layers: list[Layer] = []
+        self._active_layer_id: int | None = None
+        self._ensure_default_layer()
+
+    # -- Layer management ------------------------------------------------ #
+
+    def _ensure_default_layer(self):
+        if not self._layers:
+            L = Layer(name="Layer 0")
+            self._layers.append(L)
+            self._active_layer_id = L.id
+
+    def get_layers(self) -> list[Layer]:
+        """Return layers ordered back→front."""
+        return list(self._layers)
+
+    def get_layer(self, layer_id: int) -> Layer | None:
+        for L in self._layers:
+            if L.id == layer_id:
+                return L
+        return None
+
+    def create_layer(self, name: str | None = None) -> Layer:
+        """Create a new layer above all existing ones (frontmost)."""
+        if name is None:
+            name = f"Layer {len(self._layers)}"
+        L = Layer(name=name)
+        self._layers.append(L)
+        self._active_layer_id = L.id
+        return L
+
+    def delete_layer(self, layer_id: int) -> bool:
+        """Delete a layer; its objects are moved to the layer below
+        (or above if removing the bottom). Returns False if last layer."""
+        if len(self._layers) <= 1:
+            return False
+        L = self.get_layer(layer_id)
+        if L is None:
+            return False
+        idx = self._layers.index(L)
+        target = self._layers[idx - 1] if idx > 0 else self._layers[idx + 1]
+        # Move objects to target layer (append to its front)
+        for oid in L._object_ids:
+            obj = self.get_object_by_id(oid)
+            if obj is not None:
+                obj.layer_id = target.id
+            target._object_ids.append(oid)
+        self._layers.remove(L)
+        if self._active_layer_id == layer_id:
+            self._active_layer_id = self._layers[-1].id
+        return True
+
+    def get_active_layer(self) -> Layer:
+        L = self.get_layer(self._active_layer_id) if self._active_layer_id is not None else None
+        return L or self._layers[-1]
+
+    def set_active_layer(self, layer_id: int) -> None:
+        if self.get_layer(layer_id):
+            self._active_layer_id = layer_id
+
+    def move_layer_up(self, layer_id: int) -> bool:
+        """Push layer one step toward front."""
+        L = self.get_layer(layer_id)
+        if L is None: return False
+        i = self._layers.index(L)
+        if i >= len(self._layers) - 1: return False
+        self._layers[i], self._layers[i + 1] = self._layers[i + 1], self._layers[i]
+        return True
+
+    def move_layer_down(self, layer_id: int) -> bool:
+        L = self.get_layer(layer_id)
+        if L is None: return False
+        i = self._layers.index(L)
+        if i <= 0: return False
+        self._layers[i], self._layers[i - 1] = self._layers[i - 1], self._layers[i]
+        return True
+
+    def _find_layer_of(self, obj_id: int) -> Layer | None:
+        for L in self._layers:
+            if obj_id in L._object_ids:
+                return L
+        return None
+
+    # -- Z-order operations inside a layer ------------------------------- #
+
+    def bring_to_front(self, obj_id: int) -> bool:
+        L = self._find_layer_of(obj_id)
+        if L is None or obj_id not in L._object_ids: return False
+        L._object_ids.remove(obj_id)
+        L._object_ids.append(obj_id)
+        return True
+
+    def send_to_back(self, obj_id: int) -> bool:
+        L = self._find_layer_of(obj_id)
+        if L is None or obj_id not in L._object_ids: return False
+        L._object_ids.remove(obj_id)
+        L._object_ids.insert(0, obj_id)
+        return True
+
+    def bring_forward(self, obj_id: int) -> bool:
+        L = self._find_layer_of(obj_id)
+        if L is None or obj_id not in L._object_ids: return False
+        i = L._object_ids.index(obj_id)
+        if i >= len(L._object_ids) - 1: return False
+        L._object_ids[i], L._object_ids[i + 1] = L._object_ids[i + 1], L._object_ids[i]
+        return True
+
+    def send_backward(self, obj_id: int) -> bool:
+        L = self._find_layer_of(obj_id)
+        if L is None or obj_id not in L._object_ids: return False
+        i = L._object_ids.index(obj_id)
+        if i <= 0: return False
+        L._object_ids[i], L._object_ids[i - 1] = L._object_ids[i - 1], L._object_ids[i]
+        return True
+
+    def move_object_to_layer(self, obj_id: int, layer_id: int) -> bool:
+        target = self.get_layer(layer_id)
+        if target is None: return False
+        cur = self._find_layer_of(obj_id)
+        if cur is None: return False
+        if cur is target: return True
+        cur._object_ids.remove(obj_id)
+        target._object_ids.append(obj_id)
+        obj = self.get_object_by_id(obj_id)
+        if obj is not None:
+            obj.layer_id = target.id
+        return True
+
+    def get_render_order(self) -> list[int]:
+        """Flat list of object IDs in back→front render order
+        (hidden layers excluded)."""
+        out: list[int] = []
+        for L in self._layers:
+            if not L.visible:
+                continue
+            out.extend(L._object_ids)
+        return out
+
+    def get_object_render_state(self, obj_id: int) -> tuple[bool, bool]:
+        """Return (visible, locked) for the object based on its layer.
+        If the object has no layer, defaults to (True, False)."""
+        L = self._find_layer_of(obj_id)
+        if L is None:
+            return True, False
+        return L.visible, L.locked
 
     @classmethod
     def instance(cls) -> Document | None:
@@ -224,6 +398,11 @@ class Document:
         self._objects.append(obj)
         self._selected_ids.add(obj.id)
         obj.parent = self
+        # New object joins the active layer at the front (topmost)
+        layer = self.get_active_layer()
+        obj.layer_id = layer.id
+        if obj.id not in layer._object_ids:
+            layer._object_ids.append(obj.id)
 
     def remove_selected(self):
         ids_to_remove = list(self._selected_ids)
@@ -233,6 +412,9 @@ class Document:
                     obj.parent.remove_child(obj)
                 elif obj in self._objects:
                     self._objects.remove(obj)
+        # Also purge from layer order lists
+        for L in self._layers:
+            L._object_ids = [i for i in L._object_ids if i not in ids_to_remove]
 
     def get_object_by_id(self, object_id: int) -> BaseObject | None:
         for obj in self._objects:

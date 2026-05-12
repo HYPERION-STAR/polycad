@@ -31,12 +31,17 @@ class AddObjectCommand:
             return
         # Remove from GL view
         self._window.gl_widget.remove_mesh_item(self._mesh_item)
+        # Remove from layer order
+        L = doc._find_layer_of(self._obj.id)
+        if L is not None and self._obj.id in L._object_ids:
+            L._object_ids.remove(self._obj.id)
         # Remove from document
         if self._obj in doc._objects:
             doc._objects.remove(self._obj)
         doc._selected_ids.discard(self._obj.id)
         self._window.object_tree.update_tree()
         self._window.prop_panel.update_for_object(None)
+        self._window._refresh_render_order()
         self._window.statusbar.showMessage(f"Undo: removed {self._obj.name}.")
 
     def redo(self):
@@ -56,9 +61,17 @@ class AddObjectCommand:
         # Re-add to document
         doc._objects.append(self._obj)
         doc._selected_ids = {self._obj.id}
+        # Restore to its original layer (frontmost slot)
+        target = doc.get_layer(self._obj.layer_id) if self._obj.layer_id is not None else None
+        if target is None:
+            target = doc.get_active_layer()
+            self._obj.layer_id = target.id
+        if self._obj.id not in target._object_ids:
+            target._object_ids.append(self._obj.id)
         self._window._apply_transform_to_mesh(self._obj)
         self._window.object_tree.update_tree()
         self._window.prop_panel.update_for_object(self._obj)
+        self._window._refresh_render_order()
         self._window.statusbar.showMessage(f"Redo: re-added {self._obj.name}.")
 
 
@@ -66,16 +79,16 @@ class DeleteObjectsCommand:
     """Undoable command for deleting objects from the scene."""
 
     def __init__(self, window, deleted_objects):
-        """deleted_objects: list of (obj, mesh_item) tuples."""
+        """deleted_objects: list of (obj, mesh_item, layer_id, layer_index) tuples."""
         self._window = window
-        self._deleted = deleted_objects  # [(obj, mesh_item), ...]
+        self._deleted = deleted_objects
 
     def undo(self):
         from polycad.scene import Document
         doc = Document.instance()
         if not doc:
             return
-        for obj, mesh_item in self._deleted:
+        for obj, mesh_item, layer_id, layer_index in self._deleted:
             # Re-add to GL view
             if mesh_item is not None:
                 self._window.gl_widget._gl_view.addItem(mesh_item)
@@ -87,8 +100,16 @@ class DeleteObjectsCommand:
                 })
                 obj._mesh_item = mesh_item
             doc._objects.append(obj)
+            # Restore to original layer at original index (clamped)
+            target = doc.get_layer(layer_id) if layer_id is not None else None
+            if target is None:
+                target = doc.get_active_layer()
+            obj.layer_id = target.id
+            insert_at = max(0, min(layer_index, len(target._object_ids)))
+            target._object_ids.insert(insert_at, obj.id)
             self._window._apply_transform_to_mesh(obj)
         self._window.object_tree.update_tree()
+        self._window._refresh_render_order()
         count = len(self._deleted)
         self._window.statusbar.showMessage(f"Undo: restored {count} object(s).")
 
@@ -97,50 +118,63 @@ class DeleteObjectsCommand:
         doc = Document.instance()
         if not doc:
             return
-        for obj, mesh_item in self._deleted:
+        for obj, mesh_item, _layer_id, _layer_index in self._deleted:
             if mesh_item is not None:
                 self._window.gl_widget.remove_mesh_item(mesh_item)
+            L = doc._find_layer_of(obj.id)
+            if L is not None and obj.id in L._object_ids:
+                L._object_ids.remove(obj.id)
             if obj in doc._objects:
                 doc._objects.remove(obj)
             doc._selected_ids.discard(obj.id)
         self._window.object_tree.update_tree()
         self._window.prop_panel.update_for_object(None)
+        self._window._refresh_render_order()
         count = len(self._deleted)
         self._window.statusbar.showMessage(f"Redo: deleted {count} object(s).")
 
 
-class ModifyObjectCommand:
-    """Undoable command for changing object properties (transform, color)."""
+class ModifyObjectsCommand:
+    """Undoable command for changing N objects' properties at once.
 
-    def __init__(self, window, obj, old_data, new_data):
+    Each entry in `edits` is (obj_id, old_data, new_data). Single-object
+    edits use the same path; multi-object edits batch into one undo unit
+    so Ctrl+Z reverts the whole multi-select rotation/translation/etc.
+    """
+
+    def __init__(self, window, edits):
         self._window = window
-        self._obj_id = obj.id
-        self._old_data = old_data
-        self._new_data = new_data
+        self._edits = [(o.id, old, new) for (o, old, new) in edits]
 
     def undo(self):
-        self._apply_data(self._old_data, "Undo: reversed property change.")
+        self._apply([(oid, old) for (oid, old, _new) in self._edits],
+                    f"Undo: reverted {len(self._edits)} change(s).")
 
     def redo(self):
-        self._apply_data(self._new_data, "Redo: restored property change.")
+        self._apply([(oid, new) for (oid, _old, new) in self._edits],
+                    f"Redo: re-applied {len(self._edits)} change(s).")
 
-    def _apply_data(self, data, msg):
+    def _apply(self, pairs, msg):
         from polycad.scene import Document
         doc = Document.instance()
         if not doc:
             return
-        obj = doc.get_object_by_id(self._obj_id)
-        if obj:
+        touched_primary = None
+        for obj_id, data in pairs:
+            obj = doc.get_object_by_id(obj_id)
+            if obj is None:
+                continue
             obj.from_data(data)
             self._window._apply_transform_to_mesh(obj)
-            self._window._on_color_changed(obj)
-            
-            # Update UI if it's currently selected
+            self._window._update_mesh_color_for(obj)
             if obj.id in doc.selected_ids:
-                self._window.gl_widget.update_gizmo_position(obj)
-                self._window.prop_panel.update_for_object(obj)
-            
-            self._window.statusbar.showMessage(msg)
+                touched_primary = obj
+        if touched_primary is not None:
+            self._window.gl_widget.update_gizmo_position(touched_primary)
+            sel = [doc.get_object_by_id(i) for i in doc.selected_ids]
+            sel = [o for o in sel if o is not None]
+            self._window.prop_panel.update_for_objects(sel)
+        self._window.statusbar.showMessage(msg)
 
 # ====================================================================== #
 #  Main Window
@@ -227,6 +261,11 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
+
+        select_all_action = QAction("Select All", self)
+        select_all_action.setShortcut("Ctrl+A")
+        select_all_action.triggered.connect(self._select_all)
+        edit_menu.addAction(select_all_action)
 
         delete_action = QAction("Delete Selected", self)
         delete_action.setShortcut("Delete")
@@ -322,7 +361,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.statusbar)
 
         # Connect signals
-        self.object_tree.tree.currentItemChanged.connect(self._on_selection_change)
+        self.object_tree.selection_changed_multi.connect(self._on_tree_selection_changed)
         self.prop_panel.transform_changed.connect(self._on_transform_changed)
         self.prop_panel.color_changed.connect(self._on_color_changed)
 
@@ -332,6 +371,20 @@ class MainWindow(QMainWindow):
         self.gl_widget.viewport_drag_finished.connect(self._on_property_edit_finished)
         
         self.prop_panel.property_edit_finished.connect(self._on_property_edit_finished)
+
+        # Tree-driven rename
+        self.object_tree.object_renamed.connect(self._on_object_renamed)
+
+        # Layer / z-order signals from ObjectTreePanel
+        self.object_tree.object_reorder_requested.connect(self._on_object_reorder)
+        self.object_tree.move_object_to_layer_requested.connect(self._on_move_object_to_layer)
+        self.object_tree.new_layer_requested.connect(self._on_new_layer)
+        self.object_tree.delete_layer_requested.connect(self._on_delete_layer)
+        self.object_tree.rename_layer_requested.connect(self._on_rename_layer)
+        self.object_tree.layer_visibility_toggled.connect(self._on_layer_visibility_toggled)
+        self.object_tree.layer_lock_toggled.connect(self._on_layer_lock_toggled)
+        self.object_tree.layer_move_requested.connect(self._on_layer_move)
+        self.object_tree.active_layer_changed.connect(self._on_active_layer_changed)
 
         self.setCentralWidget(central)
 
@@ -471,7 +524,10 @@ class MainWindow(QMainWindow):
         self._update_object_count()
         self.object_tree.update_tree()
         self.prop_panel.update_for_object(obj)
-        self.statusbar.showMessage(f"Added {name} to scene.")
+        self._refresh_render_order()
+        self.statusbar.showMessage(
+            f"Added {name} to scene ({doc.get_active_layer().name})."
+        )
 
     # ------------------------------------------------------------------ #
     #  Delete selected (with undo support)
@@ -490,15 +546,22 @@ class MainWindow(QMainWindow):
             return
 
         # Collect objects and their mesh items for undo
-        deleted_pairs = []
+        deleted_records = []
         for obj_id in selected:
             obj = doc.get_object_by_id(obj_id)
             if obj:
                 mesh_item = getattr(obj, '_mesh_item', None)
-                deleted_pairs.append((obj, mesh_item))
+                # Snapshot the layer location for proper undo restoration
+                L = doc._find_layer_of(obj.id)
+                layer_id = L.id if L else None
+                layer_index = L._object_ids.index(obj.id) if L and obj.id in L._object_ids else 0
+                deleted_records.append((obj, mesh_item, layer_id, layer_index))
                 # Remove from GL view
                 if mesh_item is not None:
                     self.gl_widget.remove_mesh_item(mesh_item)
+                # Remove from layer
+                if L is not None and obj.id in L._object_ids:
+                    L._object_ids.remove(obj.id)
                 # Remove from document
                 if obj in doc._objects:
                     doc._objects.remove(obj)
@@ -506,15 +569,16 @@ class MainWindow(QMainWindow):
         doc._selected_ids.clear()
 
         # Push undo command
-        if deleted_pairs:
-            cmd = DeleteObjectsCommand(self, deleted_pairs)
+        if deleted_records:
+            cmd = DeleteObjectsCommand(self, deleted_records)
             doc.push_command(cmd)
 
-        count = len(deleted_pairs)
+        count = len(deleted_records)
         self.statusbar.showMessage(f"Deleted {count} object(s).")
         self._update_object_count()
         self.object_tree.update_tree()
         self.prop_panel.update_for_object(None)
+        self._refresh_render_order()
 
     # ------------------------------------------------------------------ #
     #  Undo / Redo
@@ -719,6 +783,7 @@ class MainWindow(QMainWindow):
             # Select the last imported object
             last_obj = doc.get_all_objects()[-1]
             self.prop_panel.update_for_object(last_obj)
+        self._refresh_render_order()
         self.statusbar.showMessage(
             f"Imported {count} object(s) from {os.path.basename(path)}"
         )
@@ -852,25 +917,31 @@ class MainWindow(QMainWindow):
     #  Selection change
     # ------------------------------------------------------------------ #
 
-    def _on_selection_change(self, current, previous):
-        """Handle selection changes from object tree."""
-        if current is None:
-            return
+    def _on_tree_selection_changed(self, obj_ids: list):
+        """Handle multi-selection from the object tree — drives Document
+        state, PropertyPanel and gizmo all at once."""
         from polycad.scene import Document
-        from PySide6.QtCore import Qt
         doc = Document.instance()
         if not doc:
             return
-        obj_id = current.data(0, Qt.ItemDataRole.UserRole)
-        if obj_id is not None:
-            doc.selected_ids = {obj_id}
-            obj = doc.get_object_by_id(obj_id)
-            if obj:
-                self.prop_panel.update_for_object(obj)
-                # Show gizmo at this object when selected from tree
-                self.gl_widget.update_gizmo_position(obj)
-                self.gl_widget._selected_obj = obj
-                self.gl_widget._gizmo.show_at(obj.position.copy())
+
+        if not obj_ids:
+            doc.selected_ids = set()
+            self.prop_panel.update_for_objects([])
+            self.gl_widget._deselect()
+            return
+
+        doc.selected_ids = set(obj_ids)
+        sel = [doc.get_object_by_id(i) for i in obj_ids]
+        sel = [o for o in sel if o is not None]
+        if not sel:
+            return
+        primary = sel[-1]
+        self.prop_panel.update_for_objects(sel)
+        # Gizmo follows the primary; other selected objects move with it
+        # via the delta-apply logic in viewport drag.
+        self.gl_widget._selected_obj = primary
+        self.gl_widget._gizmo.show_at(primary.position.copy())
 
     # ------------------------------------------------------------------ #
     #  Viewport click-to-select and gizmo drag
@@ -897,22 +968,51 @@ class MainWindow(QMainWindow):
             self.statusbar.showMessage("Selection cleared.")
 
     def _on_viewport_move(self, obj):
-        """Called in real-time while the user drags a gizmo axis."""
-        self._apply_transform_to_mesh(obj)
-        self.prop_panel.update_for_object(obj)
+        """Called in real-time while the user drags a gizmo axis.
+        Every selected object's mesh transform is refreshed so multi-select
+        drags move the whole group together."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if doc and obj is not None and obj.id in doc.selected_ids and len(doc.selected_ids) > 1:
+            for oid in doc.selected_ids:
+                o = doc.get_object_by_id(oid)
+                if o is not None:
+                    self._apply_transform_to_mesh(o)
+            sel = [doc.get_object_by_id(i) for i in doc.selected_ids]
+            sel = [o for o in sel if o is not None]
+            self.prop_panel.update_for_objects(sel)
+        else:
+            self._apply_transform_to_mesh(obj)
+            self.prop_panel.update_for_object(obj)
 
     # ------------------------------------------------------------------ #
     #  Transform sync — property panel → GL viewport
     # ------------------------------------------------------------------ #
 
     def _on_transform_changed(self, obj):
-        """Called when the user edits Position/Rotation/Scale in the panel."""
-        self._apply_transform_to_mesh(obj)
-        # Keep the gizmo in sync with the new position
+        """Spinbox edit fired from PropertyPanel. Apply the resulting
+        transform to ALL selected objects' meshes so multi-select rotation
+        / translation / scale stays visible in the viewport."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if doc and obj is not None and obj.id in doc.selected_ids and len(doc.selected_ids) > 1:
+            for oid in doc.selected_ids:
+                o = doc.get_object_by_id(oid)
+                if o is not None:
+                    self._apply_transform_to_mesh(o)
+        else:
+            self._apply_transform_to_mesh(obj)
+        # Gizmo trails the primary
         self.gl_widget.update_gizmo_position(obj)
 
     def _on_color_changed(self, obj):
-        """Called when the user picks a new color in the panel."""
+        """Called when the user picks a new color in the panel (per-object)."""
+        self._update_mesh_color_for(obj)
+
+    def _update_mesh_color_for(self, obj):
+        """Helper: push the object's current colour into its GL mesh item."""
+        if obj is None:
+            return
         mesh_item = getattr(obj, '_mesh_item', None)
         if mesh_item is not None:
             self.gl_widget.update_mesh_color(
@@ -920,12 +1020,16 @@ class MainWindow(QMainWindow):
                 (float(obj.color[0]), float(obj.color[1]), float(obj.color[2]))
             )
 
-    def _on_property_edit_finished(self, obj, old_data, new_data):
-        """Called when a spinbox edit or viewport drag concludes."""
+    def _on_property_edit_finished(self, edits: list):
+        """Called when a spinbox edit session or viewport drag concludes.
+        `edits` is a list of (obj, old_data, new_data) tuples — batches
+        into one undo entry covering the whole multi-edit."""
+        if not edits:
+            return
         from polycad.scene import Document
         doc = Document.instance()
         if doc:
-            cmd = ModifyObjectCommand(self, obj, old_data, new_data)
+            cmd = ModifyObjectsCommand(self, edits)
             doc.push_command(cmd)
 
     def _apply_transform_to_mesh(self, obj):
@@ -975,6 +1079,233 @@ class MainWindow(QMainWindow):
         doc = Document.instance()
         count = len(doc.get_all_objects()) if doc else 0
         self.obj_count_label.setText(f"Objects: {count}")
+
+    # ------------------------------------------------------------------ #
+    #  Select-all
+    # ------------------------------------------------------------------ #
+
+    def _select_all(self):
+        """Ctrl+A — select every object that lives in a visible, unlocked layer.
+        Drives the tree's multi-selection so the PropertyPanel switches into
+        multi-edit mode and subsequent rotates / moves / scales / colour
+        picks / deletes fan out across the whole selection."""
+        from polycad.scene import Document
+        from PySide6.QtCore import Qt as _Qt
+        doc = Document.instance()
+        if not doc:
+            return
+
+        ids: list[int] = []
+        for obj in doc.get_all_objects():
+            visible, locked = doc.get_object_render_state(obj.id)
+            if visible and not locked:
+                ids.append(obj.id)
+
+        if not ids:
+            self.statusbar.showMessage("Nothing to select.")
+            return
+
+        doc.selected_ids = set(ids)
+
+        # Reflect the selection in the tree without firing per-row signals
+        tree = self.object_tree.tree
+        tree.blockSignals(True)
+        try:
+            it = tree.topLevelItemCount()
+            for i in range(it):
+                layer_item = tree.topLevelItem(i)
+                for j in range(layer_item.childCount()):
+                    child = layer_item.child(j)
+                    cid = child.data(0, _Qt.ItemDataRole.UserRole)
+                    if cid is not None and int(cid) in doc.selected_ids:
+                        child.setSelected(True)
+                    else:
+                        child.setSelected(False)
+        finally:
+            tree.blockSignals(False)
+
+        sel = [doc.get_object_by_id(i) for i in ids]
+        sel = [o for o in sel if o is not None]
+        self.prop_panel.update_for_objects(sel)
+        primary = sel[-1]
+        self.gl_widget._selected_obj = primary
+        self.gl_widget._gizmo.show_at(primary.position.copy())
+        self.statusbar.showMessage(f"Selected {len(sel)} object(s).")
+
+    # ------------------------------------------------------------------ #
+    #  Layer / z-order plumbing
+    # ------------------------------------------------------------------ #
+
+    def _refresh_render_order(self):
+        """Reorder GL view items and update mesh visibility based on layers."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        ordered = []
+        for oid in doc.get_render_order():
+            obj = doc.get_object_by_id(oid)
+            if obj is None:
+                continue
+            mesh = getattr(obj, '_mesh_item', None)
+            if mesh is not None:
+                ordered.append(mesh)
+        if ordered:
+            self.gl_widget.set_render_order(ordered)
+        # Apply per-mesh visibility based on owning layer's `visible` flag
+        for obj in doc.get_all_objects():
+            mesh = getattr(obj, '_mesh_item', None)
+            if mesh is None:
+                continue
+            visible, _ = doc.get_object_render_state(obj.id)
+            self.gl_widget.set_mesh_visibility(mesh, visible)
+
+    def _on_object_reorder(self, action: str, obj_id: int):
+        """Bring/Send object within its layer."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        changed = {
+            "front":    doc.bring_to_front,
+            "forward":  doc.bring_forward,
+            "backward": doc.send_backward,
+            "back":     doc.send_to_back,
+        }.get(action, lambda _i: False)(obj_id)
+        if changed:
+            self._refresh_render_order()
+            self.object_tree.update_tree()
+            self.statusbar.showMessage(f"Object reordered: {action}.")
+
+    def _on_move_object_to_layer(self, obj_id: int, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        if doc.move_object_to_layer(obj_id, layer_id):
+            L = doc.get_layer(layer_id)
+            self._refresh_render_order()
+            self.object_tree.update_tree()
+            self.statusbar.showMessage(f"Moved object to {L.name if L else 'layer'}.")
+
+    def _on_new_layer(self):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        L = doc.create_layer()
+        self._refresh_render_order()
+        self.object_tree.update_tree()
+        self.statusbar.showMessage(f"New layer added: {L.name} (active).")
+
+    def _on_delete_layer(self, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        L = doc.get_layer(layer_id)
+        if L is None:
+            return
+        if doc.delete_layer(layer_id):
+            self._refresh_render_order()
+            self.object_tree.update_tree()
+            self.statusbar.showMessage(f"Deleted layer: {L.name} (objects merged).")
+        else:
+            self.statusbar.showMessage("Cannot delete the last remaining layer.")
+
+    def _on_rename_layer(self, layer_id: int, new_name: str):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        L = doc.get_layer(layer_id)
+        if L is None:
+            return
+        L.name = new_name
+        self.object_tree.update_tree()
+        self.statusbar.showMessage(f"Layer renamed: {new_name}.")
+
+    def _on_layer_visibility_toggled(self, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        L = doc.get_layer(layer_id)
+        if L is None:
+            return
+        L.visible = not L.visible
+        # If the currently selected object is in a now-hidden layer, deselect
+        if not L.visible:
+            for oid in list(doc.selected_ids):
+                if oid in L._object_ids:
+                    doc.deselect_all()
+                    self.prop_panel.update_for_object(None)
+                    self.gl_widget._deselect()
+                    break
+        self._refresh_render_order()
+        self.object_tree.update_tree()
+        self.statusbar.showMessage(
+            f"Layer '{L.name}' is now {'visible' if L.visible else 'hidden'}."
+        )
+
+    def _on_layer_lock_toggled(self, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        L = doc.get_layer(layer_id)
+        if L is None:
+            return
+        L.locked = not L.locked
+        # If a now-locked layer holds the selection, drop the gizmo
+        if L.locked:
+            for oid in list(doc.selected_ids):
+                if oid in L._object_ids:
+                    self.gl_widget._deselect()
+                    break
+        self.object_tree.update_tree()
+        self.statusbar.showMessage(
+            f"Layer '{L.name}' is now {'locked' if L.locked else 'unlocked'}."
+        )
+
+    def _on_layer_move(self, direction: str, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        changed = (doc.move_layer_up(layer_id) if direction == "up"
+                   else doc.move_layer_down(layer_id))
+        if changed:
+            self._refresh_render_order()
+            self.object_tree.update_tree()
+            self.statusbar.showMessage(f"Layer moved {direction}.")
+
+    def _on_object_renamed(self, obj_id: int, new_name: str):
+        """User finished an inline rename in the tree — refresh the
+        property panel (so its title reflects the new name) and report."""
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        obj = doc.get_object_by_id(obj_id)
+        if obj is None:
+            return
+        if obj.id in doc.selected_ids:
+            sel = [doc.get_object_by_id(i) for i in doc.selected_ids]
+            sel = [o for o in sel if o is not None]
+            self.prop_panel.update_for_objects(sel)
+        self.statusbar.showMessage(f"Renamed: {new_name}")
+
+    def _on_active_layer_changed(self, layer_id: int):
+        from polycad.scene import Document
+        doc = Document.instance()
+        if not doc:
+            return
+        doc.set_active_layer(layer_id)
+        L = doc.get_layer(layer_id)
+        self.object_tree.update_tree()
+        if L:
+            self.statusbar.showMessage(f"Active layer: {L.name}.")
 
     def closeEvent(self, event):
         """Clean up pyqtgraph items on close."""
